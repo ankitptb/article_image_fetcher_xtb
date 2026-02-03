@@ -128,7 +128,7 @@ def upload_to_s3(s3, buffer, key):
         },
     )
 
-    return f"https://{BUCKET_NAME}.s3.amazonaws.com/{key}"
+    return f"https://xtb-internal-tools.s3.us-east-1.amazonaws.com/{key}"
 
 # ---------------- MAIN API ----------------
 
