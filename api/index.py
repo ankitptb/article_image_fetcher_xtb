@@ -1,11 +1,10 @@
 import os
 import requests
+import boto3
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from io import BytesIO
 from PIL import Image
-import cloudinary
-import cloudinary.uploader
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
@@ -20,61 +19,62 @@ MIN_WIDTH = 600
 MIN_HEIGHT = 300
 MIN_RATIO = 0.8
 MAX_RATIO = 2.2
-MAX_IMAGES_PER_ARTICLE = 1  # 🔥 important
+MAX_IMAGES_PER_ARTICLE = 1
 
-# -------------- FASTAPI -----------------
+MAX_FILE_SIZE_KB = 800
+S3_FOLDER_ARTICLE = "xtbscrapimg"
+
+# ---------------- FASTAPI ----------------
 
 app = FastAPI()
 
 class ArticleRequest(BaseModel):
     articleUrls: List[str]
 
-# -------- HEALTH CHECK --------
-
 @app.get("/")
 def health():
-    return {
-        "status": "ok",
-        "service": "Article Image Fetcher",
-    }
+    return {"status": "ok"}
 
-# -------- CLOUDINARY INIT --------
+# ---------------- S3 CLIENT ----------------
 
-def init_cloudinary():
+def get_s3_client():
     try:
-        cloudinary.config(
-            cloud_name=os.environ["CLOUDINARY_CLOUD_NAME"],
-            api_key=os.environ["CLOUDINARY_API_KEY"],
-            api_secret=os.environ["CLOUDINARY_API_SECRET"],
+        return boto3.client(
+            "s3",
+            region_name=os.environ["AWS_REGION"],
+            aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+            aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
         )
     except KeyError:
-        raise HTTPException(status_code=500, detail="Cloudinary env vars missing")
+        raise HTTPException(status_code=500, detail="AWS env vars missing")
 
-# -------- IMAGE EXTRACTION --------
+BUCKET_NAME = os.environ.get("AWS_S3_BUCKET")
+
+# ---------------- IMAGE SCRAPING ----------------
 
 def extract_image_urls(article_url):
     response = requests.get(article_url, headers=HEADERS, timeout=15)
     soup = BeautifulSoup(response.text, "lxml")
 
-    image_urls = []
+    urls = []
 
     og = soup.find("meta", property="og:image")
     if og and og.get("content"):
-        image_urls.append(urljoin(article_url, og["content"]))
+        urls.append(urljoin(article_url, og["content"]))
 
     for fig in soup.find_all("figure"):
         img = fig.find("img")
         if img and img.get("src"):
-            image_urls.append(urljoin(article_url, img["src"]))
+            urls.append(urljoin(article_url, img["src"]))
 
     for img in soup.find_all("img"):
         src = img.get("src") or img.get("data-src")
         if src:
-            image_urls.append(urljoin(article_url, src))
+            urls.append(urljoin(article_url, src))
 
-    return list(dict.fromkeys(image_urls))
+    return list(dict.fromkeys(urls))
 
-# -------- IMAGE VALIDATION --------
+# ---------------- IMAGE VALIDATION ----------------
 
 def fetch_and_validate_image(image_url):
     if image_url.startswith("data:image") or image_url.lower().endswith(".svg"):
@@ -87,61 +87,78 @@ def fetch_and_validate_image(image_url):
         w, h = img.size
         ratio = w / h
 
-        if (
-            w >= MIN_WIDTH
-            and h >= MIN_HEIGHT
-            and MIN_RATIO <= ratio <= MAX_RATIO
-        ):
+        if w >= MIN_WIDTH and h >= MIN_HEIGHT and MIN_RATIO <= ratio <= MAX_RATIO:
             return img
-
     except Exception:
         return None
 
     return None
 
-# -------- CLOUDINARY UPLOAD --------
+# ---------------- IMAGE COMPRESS ----------------
 
-def upload_to_cloudinary(img, public_id):
+def compress_image(img):
+    quality = 85
     buffer = BytesIO()
-    img.save(buffer, format="JPEG", quality=90)
-    buffer.seek(0)
 
-    result = cloudinary.uploader.upload(
+    while quality >= 60:
+        buffer.seek(0)
+        buffer.truncate(0)
+
+        img.save(buffer, format="JPEG", quality=quality, optimize=True)
+        size_kb = buffer.tell() / 1024
+
+        if size_kb <= MAX_FILE_SIZE_KB:
+            buffer.seek(0)
+            return buffer
+
+        quality -= 5
+
+    buffer.seek(0)
+    return buffer
+
+# ---------------- S3 UPLOAD ----------------
+
+def upload_to_s3(s3, buffer, key):
+    s3.upload_fileobj(
         buffer,
-        folder="article-images",
-        public_id=public_id,
-        overwrite=True,
-        resource_type="image",
+        BUCKET_NAME,
+        key,
+        ExtraArgs={
+            "ContentType": "image/jpeg",
+        },
     )
 
-    return result["secure_url"]
+    return f"https://{BUCKET_NAME}.s3.amazonaws.com/{key}"
 
-# -------- MAIN API --------
+# ---------------- MAIN API ----------------
 
 @app.post("/fetch-article-images")
 def fetch_article_images(payload: ArticleRequest):
-    init_cloudinary()
+    s3 = get_s3_client()
 
     results = []
 
     for idx, article_url in enumerate(payload.articleUrls):
-        images = []
+        article_images = []
 
         image_urls = extract_image_urls(article_url)
 
-        for img_idx, image_url in enumerate(image_urls):
+        for image_url in image_urls:
             img = fetch_and_validate_image(image_url)
             if not img:
                 continue
 
-            public_id = f"article_{idx+1}_hero"
-            cloud_url = upload_to_cloudinary(img, public_id)
-            images.append(cloud_url)
-            break  # ✅ only best image
+            buffer = compress_image(img)
+
+            key = f"{S3_FOLDER_ARTICLE}/article_{idx+1}_hero.jpg"
+            image_url_s3 = upload_to_s3(s3, buffer, key)
+
+            article_images.append(image_url_s3)
+            break
 
         results.append({
             "articleUrl": article_url,
-            "articleImages": images
+            "articleImages": article_images
         })
 
     return {
