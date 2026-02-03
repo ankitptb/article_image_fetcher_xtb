@@ -8,6 +8,9 @@ from PIL import Image
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
+import base64
+from io import BytesIO
+import uuid
 
 # ---------------- CONFIG ----------------
 
