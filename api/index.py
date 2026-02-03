@@ -9,7 +9,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
 import base64
-from io import BytesIO
 import uuid
 
 # ---------------- CONFIG ----------------
@@ -25,7 +24,9 @@ MAX_RATIO = 2.2
 MAX_IMAGES_PER_ARTICLE = 1
 
 MAX_FILE_SIZE_KB = 800
+
 S3_FOLDER_ARTICLE = "xtbscrapimg"
+S3_FOLDER_GEMINI = "xtbgemimg"
 
 # ---------------- FASTAPI ----------------
 
@@ -33,6 +34,12 @@ app = FastAPI()
 
 class ArticleRequest(BaseModel):
     articleUrls: List[str]
+
+class GeminiImage(BaseModel):
+    base64: str
+
+class GeminiUploadRequest(BaseModel):
+    images: List[GeminiImage]
 
 @app.get("/")
 def health():
@@ -99,7 +106,7 @@ def fetch_and_validate_image(image_url):
 
 # ---------------- IMAGE COMPRESS ----------------
 
-def compress_image(img):
+def compress_image(img: Image.Image) -> BytesIO:
     quality = 85
     buffer = BytesIO()
 
@@ -128,23 +135,21 @@ def upload_to_s3(s3, buffer, key):
         key,
         ExtraArgs={
             "ContentType": "image/jpeg",
-            "ACL": "public-read"   # 👈 IMPORTANT
+            "ACL": "public-read"
         },
     )
 
     return f"https://{BUCKET_NAME}.s3.us-east-1.amazonaws.com/{key}"
 
-# ---------------- MAIN API ----------------
+# ---------------- ARTICLE IMAGE API ----------------
 
 @app.post("/fetch-article-images")
 def fetch_article_images(payload: ArticleRequest):
     s3 = get_s3_client()
-
     results = []
 
     for idx, article_url in enumerate(payload.articleUrls):
         article_images = []
-
         image_urls = extract_image_urls(article_url)
 
         for image_url in image_urls:
@@ -153,11 +158,10 @@ def fetch_article_images(payload: ArticleRequest):
                 continue
 
             buffer = compress_image(img)
-
             key = f"{S3_FOLDER_ARTICLE}/article_{idx+1}_hero.jpg"
-            image_url_s3 = upload_to_s3(s3, buffer, key)
+            s3_url = upload_to_s3(s3, buffer, key)
 
-            article_images.append(image_url_s3)
+            article_images.append(s3_url)
             break
 
         results.append({
@@ -168,4 +172,34 @@ def fetch_article_images(payload: ArticleRequest):
     return {
         "count": len(results),
         "articles": results
+    }
+
+# ---------------- GEMINI IMAGE UPLOAD API ----------------
+
+@app.post("/upload-gemini-images")
+def upload_gemini_images(payload: GeminiUploadRequest):
+    s3 = get_s3_client()
+    uploaded_urls = []
+
+    for img_obj in payload.images:
+        base64_str = img_obj.base64
+
+        # Remove data URI prefix if present
+        if "," in base64_str:
+            base64_str = base64_str.split(",")[1]
+
+        image_bytes = base64.b64decode(base64_str)
+        img = Image.open(BytesIO(image_bytes)).convert("RGB")
+
+        buffer = compress_image(img)
+
+        filename = f"{uuid.uuid4().hex}.jpg"
+        key = f"{S3_FOLDER_GEMINI}/{filename}"
+
+        s3_url = upload_to_s3(s3, buffer, key)
+        uploaded_urls.append(s3_url)
+
+    return {
+        "count": len(uploaded_urls),
+        "images": uploaded_urls
     }
